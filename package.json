@@ -1,0 +1,19 @@
+{
+  "name": "mcap-decoding-speed",
+  "version": "0.1.0",
+  "packageManager": "yarn@3.6.3",
+  "description": "simple web app outputing decoding speed for messages in an mcap file",
+  "main": "index.js",
+  "scripts": {
+    "build": "NODE_ENV=production webpack --config webpack.config.js",
+    "start": "webpack-dev-server"
+  },
+  "private": true,
+  "author": "Hans-Joachim Krauch",
+  "license": "MIT",
+  "workspaces": [
+    "packages/app",
+    "packages/studio/packages/mcap-support",
+    "packages/studio/packages/@types/protobufjs"
+  ]
+}

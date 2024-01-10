@@ -1,0 +1,36 @@
+{
+  "name": "app",
+  "version": "0.1.0",
+  "description": "simple web app outputing decoding speed of messages in a mcap file",
+  "main": "index.js",
+  "scripts": {
+    "build": "NODE_ENV=production webpack --config webpack.config.js",
+    "start": "webpack-dev-server"
+  },
+  "author": "Hans-Joachim Krauch",
+  "license": "MIT",
+  "dependencies": {
+    "@emotion/react": "^11.11.3",
+    "@emotion/styled": "^11.11.0",
+    "@mcap/browser": "^1.0.0",
+    "@mcap/core": "^2.0.2",
+    "@mcap/support": "^1.0.0",
+    "@mui/material": "^5.15.4",
+    "buffer": "^6.0.3",
+    "path-browserify": "^1.0.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@foxglove/mcap-support": "workspace:*",
+    "@foxglove/tsconfig": "2.0.0",
+    "@types/react": "^18.2.47",
+    "@types/react-dom": "^18.2.18",
+    "html-webpack-plugin": "^5.5.3",
+    "ts-loader": "^9.5.1",
+    "typescript": "5.2.2",
+    "webpack": "5.88.2",
+    "webpack-cli": "^5.1.4",
+    "webpack-dev-server": "^4.15.1"
+  }
+}

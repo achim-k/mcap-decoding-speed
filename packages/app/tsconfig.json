@@ -1,0 +1,12 @@
+{
+  "extends": "@foxglove/tsconfig/base",
+  "include": ["./*"],
+  "compilerOptions": {
+    "outDir": "./dist",
+    "lib": ["dom", "dom.iterable", "es2022", "webworker"],
+    "paths": {
+      "@foxglove/mcap-support": ["../studio/packages/mcap-support"]
+    },
+    "jsx": "react-jsx",
+  }
+}
