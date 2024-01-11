@@ -1,6 +1,7 @@
 export type ChannelResult = {
   id: number
   topic: string
+  schemaName: string
   schemaEncoding: string
   messageEncoding: string
   totalBytes: number,

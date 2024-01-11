@@ -26,6 +26,7 @@ export default function Results(props: { results: ChannelResult[] }) {
         <TableHead>
           <TableRow>
             <TableCell>Topic</TableCell>
+            <TableCell align="right">Schema</TableCell>
             <TableCell align="right">Schema encoding</TableCell>
             <TableCell align="right">Message encoding</TableCell>
             <TableCell align="right">Messages</TableCell>
@@ -42,6 +43,9 @@ export default function Results(props: { results: ChannelResult[] }) {
             >
               <TableCell component="th" scope="row">
                 {channelResult.topic}
+              </TableCell>
+              <TableCell align="right">
+                {channelResult.schemaName}
               </TableCell>
               <TableCell align="right">
                 {channelResult.schemaEncoding}

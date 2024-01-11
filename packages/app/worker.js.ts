@@ -98,6 +98,7 @@ async function run(blob: Blob, chunkSizeBytes: number) {
       results.push({
         id: channel.id,
         topic: channel.topic,
+        schemaName: schema?.name ?? "?",
         schemaEncoding: schema?.encoding ?? "?",
         messageEncoding: channel.messageEncoding,
         totalBytes,
