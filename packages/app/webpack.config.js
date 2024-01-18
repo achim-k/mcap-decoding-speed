@@ -21,6 +21,7 @@ module.exports = {
     layers: true,
     syncWebAssembly: true,
   },
+  devtool: 'source-map',
   module: {
     rules: [
       {

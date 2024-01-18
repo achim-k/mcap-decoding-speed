@@ -8,5 +8,6 @@
       "@foxglove/mcap-support": ["../studio/packages/mcap-support"]
     },
     "jsx": "react-jsx",
+    "sourceMap": true
   }
 }
