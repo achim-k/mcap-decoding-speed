@@ -32,10 +32,11 @@ type State = {
   isRunning: boolean;
   totalTimeSec: number;
   realTimeFactor: number;
+  medianDeserializationDuration: number;
   medianCycleDuration: number;
-  medianFetchMessageDurations: number;
-  medianPostMessageDurations: number;
-  medianStructuredDeserializeDurations: number;
+  medianFetchMessageDuration: number;
+  medianPostMessageDuration: number;
+  medianStructuredDeserializeDuration: number;
   progress: number;
 };
 
@@ -43,10 +44,11 @@ const EMPTY_STATE: State = {
   isRunning: false,
   totalTimeSec: 0,
   realTimeFactor: 0,
+  medianDeserializationDuration: 0,
   medianCycleDuration: 0,
-  medianFetchMessageDurations: 0,
-  medianPostMessageDurations: 0,
-  medianStructuredDeserializeDurations: 0,
+  medianFetchMessageDuration: 0,
+  medianPostMessageDuration: 0,
+  medianStructuredDeserializeDuration: 0,
   progress: 0,
 };
 
@@ -56,6 +58,7 @@ type RunState = {
   firstMessageLogTime?: bigint;
   currentLogTime?: bigint;
   startMs?: number;
+  deserializationDurations: number[];
   cycleDurations: number[];
   fetchMessageDurations: number[];
   postMessageDurations: number[];
@@ -67,6 +70,7 @@ const worker = new WorkerInterface();
 const runState: RunState = {
   statsByChannel: new Map(),
   deserializerByChannelId: new Map(),
+  deserializationDurations: [],
   cycleDurations: [],
   fetchMessageDurations: [],
   postMessageDurations: [],
@@ -98,6 +102,7 @@ function App() {
         )
       );
       const realTimeFactor = secondsRead / secondsSinceStart;
+      const medianDeserializationDuration = median(runState.deserializationDurations);
       const medianCycleDuration = median(runState.cycleDurations);
       const medianFetchMessageDurations = median(
         runState.fetchMessageDurations
@@ -106,6 +111,7 @@ function App() {
         runState.structuredDeserializeDurations
       );
       const medianPostMessageDurations = median(runState.postMessageDurations);
+      runState.deserializationDurations = [];
       runState.cycleDurations = [];
       runState.fetchMessageDurations = [];
       runState.structuredDeserializeDurations = [];
@@ -121,11 +127,12 @@ function App() {
         ...oldState,
         totalTimeSec: secondsSinceStart,
         realTimeFactor,
+        medianDeserializationDuration: medianDeserializationDuration ?? 0,
         medianCycleDuration: medianCycleDuration ?? 0,
-        medianFetchMessageDurations: medianFetchMessageDurations ?? 0,
-        medianStructuredDeserializeDurations:
+        medianFetchMessageDuration: medianFetchMessageDurations ?? 0,
+        medianStructuredDeserializeDuration:
           medianStructuredDeserializeDurations ?? 0,
-        medianPostMessageDurations: medianPostMessageDurations ?? 0,
+        medianPostMessageDuration: medianPostMessageDurations ?? 0,
         progress,
       }));
     }, 500);
@@ -253,6 +260,7 @@ function App() {
       runState.firstMessageLogTime ??= messages[0]?.logTime;
       runState.currentLogTime = messages[0]?.logTime;
 
+      let deserializationDuration = 0;
       for (const msg of messages) {
         if (config.deserializeInWorker) {
           const { channelId, sizeInBytes, deserializationTimeMs } =
@@ -261,6 +269,7 @@ function App() {
           channelStats.totalBytes += sizeInBytes;
           channelStats.totalMessages += 1;
           channelStats.totalDurationMs += deserializationTimeMs;
+          deserializationDuration += deserializationTimeMs;
         } else {
           const { channelId, data } = msg as RawMessage;
           const channelStats = runState.statsByChannel.get(channelId)!;
@@ -272,6 +281,7 @@ function App() {
             deserialize(data);
             const deserializationTimeMs = performance.now() - start;
             channelStats.totalDurationMs += deserializationTimeMs;
+            deserializationDuration += deserializationTimeMs;
           }
         }
       }
@@ -281,6 +291,7 @@ function App() {
       }
 
       const cycleDuration = performance.now() - cycleStart;
+      runState.deserializationDurations.push(deserializationDuration);
       runState.cycleDurations.push(cycleDuration);
       runState.fetchMessageDurations.push(fetchDuration);
       runState.postMessageDurations.push(postMessageDuration);
@@ -371,29 +382,32 @@ function App() {
             Elapsed time: <b>{state.totalTimeSec.toFixed(2)}</b> s
           </Typography>
         </Tooltip>
+        <Typography>
+          Message fetching:{" "}
+          <Tooltip title="Median message fetching (total) duration">
+            <b>{state.medianFetchMessageDuration.toFixed(2)}</b>
+          </Tooltip>{" "}
+          |{" "}
+          <Tooltip title="Median structuredDeserialize duration">
+            <b>{state.medianStructuredDeserializeDuration.toFixed(2)}</b>
+          </Tooltip>{" "}
+          |{" "}
+          <Tooltip title="Median postMessage duration">
+            <b>{state.medianPostMessageDuration.toFixed(2)}</b>
+          </Tooltip>{" "}
+          ms{" "}
+        </Typography>
+        <Tooltip title={`Median time to deserialize all messages in the batch`}>
           <Typography>
-            Message fetching:{" "}
-            <Tooltip title="Median message fetching (total) duration">
-            <b>
-              {state.medianFetchMessageDurations.toFixed(2)}
-            </b></Tooltip>
-            {" "}|{" "}
-            <Tooltip title="Median structuredDeserialize duration">
-            <b>
-              {state.medianStructuredDeserializeDurations.toFixed(2)}
-            </b></Tooltip>
-            {" "}|{" "}
-            <Tooltip title="Median postMessage duration">
-            <b>
-              {state.medianPostMessageDurations.toFixed(2)}
-            </b></Tooltip>
-            {" "}ms{" "}
+            Deserialization:{" "}
+            <b>{state.medianDeserializationDuration.toFixed(2)}</b> ms
           </Typography>
+        </Tooltip>
         <Tooltip
           title={`Median time to fetch and deserialize messages of the specified bulk size (${config.messageBatchSize})`}
         >
           <Typography>
-            Cycle duration: <b>{state.medianCycleDuration.toFixed(2)}</b> ms
+            Total: <b>{state.medianCycleDuration.toFixed(2)}</b> ms
           </Typography>
         </Tooltip>
         <Tooltip title="Factor indicating if messages can be read in realtime speed. A factor of 1 means that messages are read at the same speed as they were recorded. Higher is better.">
