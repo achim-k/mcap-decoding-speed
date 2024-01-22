@@ -2,18 +2,22 @@ import { loadDecompressHandlers } from "@mcap/support";
 import { McapIndexedReader } from "@mcap/core";
 import { BlobReadable } from "@mcap/browser";
 import { ParsedChannel, parseChannel } from "@foxglove/mcap-support";
-import { Message, RawMessage, WorkerInterface } from "./types";
-import * as comlink from "comlink";
+import {
+  Message,
+  WorkerRequest,
+  RawMessage,
+  WorkerReponse,
+} from "./types";
 import { TypedMcapRecords } from "@mcap/core/dist/esm/src/types";
 
 const decompressHandlersPromise = loadDecompressHandlers();
 
-class WorkerReader implements WorkerInterface {
+class WorkerReader {
   #reader?: McapIndexedReader;
   #deserialize: boolean = true;
   #deserializerByChannelId: Map<number, ParsedChannel["deserialize"]> =
     new Map();
-  #iterator?: AsyncGenerator<TypedMcapRecords["Message"], void, void>
+  #iterator?: AsyncGenerator<TypedMcapRecords["Message"], void, void>;
 
   public async initialize(blob: Blob) {
     const decompressHandlers = await decompressHandlersPromise;
@@ -114,16 +118,52 @@ class WorkerReader implements WorkerInterface {
       }
     }
 
-    if (this.#deserialize) {
-      return messages;
-    } else {
-      return comlink.transfer(
-        messages,
-        messages.map((msg) => (msg as RawMessage).data.buffer)
-      );
-    }
+    return messages;
   }
 }
 
 const obj = new WorkerReader();
-comlink.expose(obj);
+
+let serializeInWorker = true;
+let lastPostMessageDuration = 0;
+self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  switch (event.data.type) {
+    case "initialize":
+      postMessage({
+        type: event.data.type,
+        fileInfo: await obj.initialize(event.data.blob),
+      });
+      break;
+    case "createIterator":
+      {
+        serializeInWorker = event.data.options.deserialize;
+        lastPostMessageDuration = 0;
+        await obj.createIterator(event.data.options);
+        const response: WorkerReponse = {
+          type: event.data.type,
+        };
+        postMessage(response);
+      }
+      break;
+    case "fetchMessages":
+      {
+        const response: WorkerReponse = {
+          type: event.data.type,
+          result: {
+            postMessageDuration: lastPostMessageDuration,
+            messages: await obj.fetchMessages(event.data.messageBatchSize),
+          },
+        };
+
+        const transferables = serializeInWorker
+        ? []
+        : response.result.messages.map(
+          (msg) => (msg as RawMessage).data.buffer
+          );
+        const postMessageStart = performance.now();
+        postMessage(response, transferables);
+        lastPostMessageDuration = performance.now() - postMessageStart;
+      }
+      break;
+  }
+};

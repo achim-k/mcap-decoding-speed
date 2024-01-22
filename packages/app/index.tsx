@@ -1,4 +1,3 @@
-import * as comlink from "comlink";
 import { createRoot } from "react-dom/client";
 
 import {
@@ -19,14 +18,9 @@ import {
   parseChannel,
 } from "../studio/packages/mcap-support/src";
 import EnhancedTable from "./ResultTable";
-import {
-  ChannelStats,
-  McapInfo,
-  Message,
-  RawMessage,
-  WorkerInterface,
-} from "./types";
+import { ChannelStats, McapInfo, Message, RawMessage } from "./types";
 import { toSec, fromNanoSec, median } from "./utils";
+import WorkerInterface from "./WorkerInterface";
 
 type Config = {
   messageBatchSize: number;
@@ -40,6 +34,8 @@ type State = {
   realTimeFactor: number;
   medianCycleDuration: number;
   medianFetchMessageDurations: number;
+  medianPostMessageDurations: number;
+  medianStructuredDeserializeDurations: number;
   progress: number;
 };
 
@@ -49,6 +45,8 @@ const EMPTY_STATE: State = {
   realTimeFactor: 0,
   medianCycleDuration: 0,
   medianFetchMessageDurations: 0,
+  medianPostMessageDurations: 0,
+  medianStructuredDeserializeDurations: 0,
   progress: 0,
 };
 
@@ -60,17 +58,19 @@ type RunState = {
   startMs?: number;
   cycleDurations: number[];
   fetchMessageDurations: number[];
+  postMessageDurations: number[];
+  structuredDeserializeDurations: number[];
   stopped?: boolean;
 };
 
-const worker = new Worker(new URL("./worker.js", import.meta.url));
-const workerProxy = comlink.wrap<WorkerInterface>(worker);
-const { initialize, createIterator, fetchMessages } = workerProxy;
+const worker = new WorkerInterface();
 const runState: RunState = {
   statsByChannel: new Map(),
   deserializerByChannelId: new Map(),
   cycleDurations: [],
   fetchMessageDurations: [],
+  postMessageDurations: [],
+  structuredDeserializeDurations: [],
 };
 
 function App() {
@@ -102,8 +102,14 @@ function App() {
       const medianFetchMessageDurations = median(
         runState.fetchMessageDurations
       );
+      const medianStructuredDeserializeDurations = median(
+        runState.structuredDeserializeDurations
+      );
+      const medianPostMessageDurations = median(runState.postMessageDurations);
       runState.cycleDurations = [];
       runState.fetchMessageDurations = [];
+      runState.structuredDeserializeDurations = [];
+      runState.postMessageDurations = [];
 
       const progress =
         fileInfo && runState.currentLogTime
@@ -117,6 +123,9 @@ function App() {
         realTimeFactor,
         medianCycleDuration: medianCycleDuration ?? 0,
         medianFetchMessageDurations: medianFetchMessageDurations ?? 0,
+        medianStructuredDeserializeDurations:
+          medianStructuredDeserializeDurations ?? 0,
+        medianPostMessageDurations: medianPostMessageDurations ?? 0,
         progress,
       }));
     }, 500);
@@ -156,7 +165,7 @@ function App() {
 
       const selectedFile = event.target.files[0]!;
       const { startTime, endTime, channelsById, schemasById } =
-        await initialize(selectedFile);
+        await worker.initialize(selectedFile);
 
       runState.statsByChannel.clear();
       runState.deserializerByChannelId.clear();
@@ -227,7 +236,7 @@ function App() {
       (channelId) => runState.statsByChannel.get(channelId)!.topic
     );
 
-    await createIterator({
+    await worker.createIterator({
       topics: selectedTopics,
       deserialize: config.deserializeInWorker,
     });
@@ -238,12 +247,13 @@ function App() {
 
     while (!runState.stopped) {
       const cycleStart = performance.now();
-      const msgs = await fetchMessages(config.messageBatchSize);
+      const { messages, postMessageDuration, structuredDeserializeDuration } =
+        await worker.fetchMessages(config.messageBatchSize);
       const fetchDuration = performance.now() - cycleStart;
-      runState.firstMessageLogTime ??= msgs[0]?.logTime;
-      runState.currentLogTime = msgs[0]?.logTime;
+      runState.firstMessageLogTime ??= messages[0]?.logTime;
+      runState.currentLogTime = messages[0]?.logTime;
 
-      for (const msg of msgs) {
+      for (const msg of messages) {
         if (config.deserializeInWorker) {
           const { channelId, sizeInBytes, deserializationTimeMs } =
             msg as Message;
@@ -266,13 +276,17 @@ function App() {
         }
       }
 
-      if (msgs.length < config.messageBatchSize) {
+      if (messages.length < config.messageBatchSize) {
         break; // End of file.
       }
 
       const cycleDuration = performance.now() - cycleStart;
       runState.cycleDurations.push(cycleDuration);
       runState.fetchMessageDurations.push(fetchDuration);
+      runState.postMessageDurations.push(postMessageDuration);
+      runState.structuredDeserializeDurations.push(
+        structuredDeserializeDuration
+      );
     }
 
     setState((oldState) => ({
@@ -286,100 +300,107 @@ function App() {
   return (
     <div>
       <Stack
-        direction={{ xs: "column", xl: "row" }}
-        justifyContent={"space-between"}
+        direction={{ xs: "column", sm: "row" }}
+        spacing={2}
+        alignItems={"center"}
       >
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          spacing={2}
-          alignItems={"center"}
-        >
+        <Input
+          ref={fileInputRef}
+          type="file"
+          inputProps={{
+            accept: ".mcap",
+          }}
+          onChange={onFileInputChange}
+          disableUnderline
+          disabled={state.isRunning}
+        />
+
+        <Stack direction={"row"} gap={1}>
+          <Typography>Fetch messages in batches of</Typography>
           <Input
-            ref={fileInputRef}
-            type="file"
-            inputProps={{
-              accept: ".mcap",
-            }}
-            onChange={onFileInputChange}
-            disableUnderline
+            sx={{ maxWidth: "60px" }}
+            id="filled-number"
+            type="number"
+            size="small"
+            value={config.messageBatchSize}
+            onChange={onInputChange}
             disabled={state.isRunning}
           />
-
-          <Stack direction={"row"} gap={1}>
-            <Typography>Fetch messages in batches of</Typography>
-            <Input
-              sx={{ maxWidth: "60px" }}
-              id="filled-number"
-              type="number"
-              size="small"
-              value={config.messageBatchSize}
-              onChange={onInputChange}
-              disabled={state.isRunning}
-            />
-          </Stack>
-          <FormGroup>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  size="small"
-                  disabled={state.isRunning}
-                  onChange={onChechboxChange}
-                  checked={config.deserializeInWorker}
-                />
-              }
-              label="Deserialize in worker"
-            />
-          </FormGroup>
-          {!state.isRunning && (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={onRunClick}
-              disabled={fileInfo == undefined}
-            >
-              Run
-            </Button>
-          )}
-          {state.isRunning && (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={onStopClick}
-              color="error"
-            >
-              Stop
-            </Button>
-          )}
         </Stack>
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          gap={2}
-          alignItems={"center"}
-        >
-          <Tooltip title="Total elapsed time">
-            <Typography>
-              Elapsed time: <b>{state.totalTimeSec.toFixed(2)}</b> s
-            </Typography>
-          </Tooltip>
-          <Tooltip title="Median time to fetch messages from the worker (may include deserialization time if this is done on the worker)">
-            <Typography>
-              Fetch duration:{" "}
-              <b>{state.medianFetchMessageDurations.toFixed(2)}</b> ms
-            </Typography>
-          </Tooltip>
-          <Tooltip
-            title={`Median time to fetch and deserialize messages of the specified bulk size (${config.messageBatchSize})`}
+        <FormGroup>
+          <FormControlLabel
+            control={
+              <Checkbox
+                size="small"
+                disabled={state.isRunning}
+                onChange={onChechboxChange}
+                checked={config.deserializeInWorker}
+              />
+            }
+            label="Deserialize in worker"
+          />
+        </FormGroup>
+        {!state.isRunning && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={onRunClick}
+            disabled={fileInfo == undefined}
           >
-            <Typography>
-              Cycle duration: <b>{state.medianCycleDuration.toFixed(2)}</b> ms
-            </Typography>
-          </Tooltip>
-          <Tooltip title="Factor indicating if messages can be read in realtime speed. A factor of 1 means that messages are read at the same speed as they were recorded. Higher is better.">
-            <Typography>
-              Reading speed: <b>{state.realTimeFactor.toFixed(2)}x</b>
-            </Typography>
-          </Tooltip>
-        </Stack>
+            Run
+          </Button>
+        )}
+        {state.isRunning && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={onStopClick}
+            color="error"
+          >
+            Stop
+          </Button>
+        )}
+      </Stack>
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        gap={2}
+        alignItems={"center"}
+      >
+        <Tooltip title="Total elapsed time">
+          <Typography>
+            Elapsed time: <b>{state.totalTimeSec.toFixed(2)}</b> s
+          </Typography>
+        </Tooltip>
+          <Typography>
+            Message fetching:{" "}
+            <Tooltip title="Median message fetching (total) duration">
+            <b>
+              {state.medianFetchMessageDurations.toFixed(2)}
+            </b></Tooltip>
+            {" "}|{" "}
+            <Tooltip title="Median structuredDeserialize duration">
+            <b>
+              {state.medianStructuredDeserializeDurations.toFixed(2)}
+            </b></Tooltip>
+            {" "}|{" "}
+            <Tooltip title="Median postMessage duration">
+            <b>
+              {state.medianPostMessageDurations.toFixed(2)}
+            </b></Tooltip>
+            {" "}ms{" "}
+          </Typography>
+        <Tooltip
+          title={`Median time to fetch and deserialize messages of the specified bulk size (${config.messageBatchSize})`}
+        >
+          <Typography>
+            Cycle duration: <b>{state.medianCycleDuration.toFixed(2)}</b> ms
+          </Typography>
+        </Tooltip>
+        <Tooltip title="Factor indicating if messages can be read in realtime speed. A factor of 1 means that messages are read at the same speed as they were recorded. Higher is better.">
+          <Typography>
+            Reading speed: <b>{state.realTimeFactor.toFixed(2)}x</b>
+          </Typography>
+        </Tooltip>
       </Stack>
 
       <Box sx={{ width: "100%", paddingTop: "1em", paddingBottom: "1em" }}>

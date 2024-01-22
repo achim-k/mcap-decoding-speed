@@ -20,12 +20,10 @@ export type McapInfo = {
   channelsById: Map<number, Channel>;
   schemasById: Map<number, Schema>;
 };
-export type WorkerInterface = {
-  initialize: (blob: Blob) => Promise<McapInfo>,
-  createIterator: (options: { topics?: string[], deserialize: boolean}) => Promise<void>,
-  fetchMessages: (messageBatchSize: number) => Promise<Message[] | RawMessage[]>,
+export type FetchMessagesResult = {
+  postMessageDuration: number,
+  messages: Message[] | RawMessage[],
 }
-
 export type ChannelStats = {
   id: number
   topic: string
@@ -36,3 +34,35 @@ export type ChannelStats = {
   totalMessages: number,
   totalDurationMs: number,
 }
+
+type InitializeRequest = {
+  type: "initialize",
+  blob: Blob,
+}
+type CreateIteratorRequest = {
+  type: "createIterator",
+  options: { topics?: string[], deserialize: boolean}
+}
+type FetchMessagesRequest = {
+  type: "fetchMessages",
+  messageBatchSize: number
+}
+export type WorkerRequest = InitializeRequest
+| CreateIteratorRequest
+| FetchMessagesRequest;
+
+type InitializeResponse = {
+  type: "initialize",
+  fileInfo: McapInfo,
+}
+type CreateIteratorResponse = {
+  type: "createIterator",
+}
+type FetchMessagesResponse = {
+  type: "fetchMessages",
+  result: FetchMessagesResult,
+}
+
+export type WorkerReponse = InitializeResponse
+| CreateIteratorResponse
+| FetchMessagesResponse;
