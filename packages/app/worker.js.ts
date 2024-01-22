@@ -2,139 +2,128 @@ import { loadDecompressHandlers } from "@mcap/support";
 import { McapIndexedReader } from "@mcap/core";
 import { BlobReadable } from "@mcap/browser";
 import { ParsedChannel, parseChannel } from "@foxglove/mcap-support";
-import { ChannelResult } from "./types";
+import { Message, RawMessage, WorkerInterface } from "./types";
+import * as comlink from "comlink";
+import { TypedMcapRecords } from "@mcap/core/dist/esm/src/types";
 
 const decompressHandlersPromise = loadDecompressHandlers();
-console.log("Worker loaded");
 
-type Measurement = {
-  numMsgs: number;
-  numBytes: number;
-  durationMs: number;
-};
-
-function measureDeserializationTime(
-  messageDatas: Uint8Array[],
-  deserialize: ParsedChannel["deserialize"]
-): Measurement {
-  let numBytes = 0;
-  const start = performance.now();
-  for (const data of messageDatas) {
-    deserialize(data);
-    numBytes += data.length;
-  }
-  const durationMs = performance.now() - start;
-  return {
-    durationMs,
-    numBytes,
-    numMsgs: messageDatas.length,
-  };
-}
-
-async function run(blob: Blob, chunkSizeBytes: number) {
-  console.log(chunkSizeBytes);
-  const decompressHandlers = await decompressHandlersPromise;
-  const reader = await McapIndexedReader.Initialize({
-    readable: new BlobReadable(blob),
-    decompressHandlers,
-  });
-
-  const deserializerByChannelId: Map<number, ParsedChannel["deserialize"]> =
+class WorkerReader implements WorkerInterface {
+  #reader?: McapIndexedReader;
+  #deserialize: boolean = true;
+  #deserializerByChannelId: Map<number, ParsedChannel["deserialize"]> =
     new Map();
+  #iterator?: AsyncGenerator<TypedMcapRecords["Message"], void, void>
 
-  for (const [, channel] of reader.channelsById.entries()) {
-    try {
-      const schema = reader.schemasById.get(channel.schemaId);
-      const { deserialize } = parseChannel({
-        messageEncoding: channel.messageEncoding,
-        schema,
-      });
-      deserializerByChannelId.set(channel.id, deserialize);
-    } catch (err) {
-      console.error(`Failed to parse channel ${channel.id} (${channel.topic})`);
+  public async initialize(blob: Blob) {
+    const decompressHandlers = await decompressHandlersPromise;
+    this.#reader = await McapIndexedReader.Initialize({
+      readable: new BlobReadable(blob),
+      decompressHandlers,
+    });
+
+    if (!this.#reader.statistics) {
+      throw new Error("Failed to read mcap statistic record");
     }
+
+    return {
+      startTime: this.#reader.statistics?.messageStartTime,
+      endTime: this.#reader.statistics?.messageEndTime,
+      channelsById: new Map(this.#reader.channelsById.entries()),
+      schemasById: new Map(this.#reader.schemasById.entries()),
+    };
   }
 
-  let chunkSizeInBytes = 0;
-  let messageDataByChannelId: Map<number, Uint8Array[]> = new Map();
-  let measurementsByChannelId: Map<number, Measurement[]> = new Map();
+  public async createIterator(options: {
+    topics?: string[];
+    deserialize: boolean;
+  }) {
+    if (!this.#reader) {
+      throw new Error("Source not initialized");
+    }
 
-  const measureDeserializationTimes = () => {
-    for (const [channelId, messages] of messageDataByChannelId.entries()) {
-      const deserialize = deserializerByChannelId.get(channelId);
-      if (deserialize == undefined) {
-        continue;
+    this.#deserialize = options.deserialize;
+    if (options.deserialize) {
+      for (const [, channel] of this.#reader.channelsById.entries()) {
+        try {
+          const schema = this.#reader.schemasById.get(channel.schemaId);
+          const { deserialize } = parseChannel({
+            messageEncoding: channel.messageEncoding,
+            schema,
+          });
+          this.#deserializerByChannelId.set(channel.id, deserialize);
+        } catch (err) {
+          console.error(
+            `Failed to parse channel ${channel.id} (${channel.topic})`
+          );
+        }
+      }
+    }
+
+    this.#iterator = this.#reader.readMessages({
+      validateCrcs: false,
+      topics: options.topics,
+    });
+  }
+
+  public async fetchMessages(
+    bulkSize: number
+  ): Promise<Message[] | RawMessage[]> {
+    if (!this.#iterator) {
+      throw new Error("Iterator not initialized");
+    }
+
+    const messages: Message[] | RawMessage[] = [];
+    for (let i = 0; i < bulkSize; i++) {
+      const { done, value } = await this.#iterator.next();
+      if (done) {
+        return messages;
       }
 
-      const measurement = measureDeserializationTime(messages, deserialize);
-      const channelMeasurements = measurementsByChannelId.get(channelId);
-      if (channelMeasurements == undefined) {
-        measurementsByChannelId.set(channelId, [measurement]);
+      if (this.#deserialize) {
+        const deserialize = this.#deserializerByChannelId.get(value.channelId);
+        const message: Partial<Message> = {
+          logTime: value.logTime,
+          channelId: value.channelId,
+          sizeInBytes: value.data.byteLength,
+        };
+
+        if (deserialize == undefined) {
+          (messages as Message[]).push({
+            ...message,
+            data: value.data,
+            deserializationTimeMs: 0,
+          } as Message);
+          continue;
+        }
+
+        const start = performance.now();
+        const data = deserialize(value.data);
+        const durationMs = performance.now() - start;
+        (messages as Message[]).push({
+          ...message,
+          data,
+          deserializationTimeMs: durationMs,
+        } as Message);
       } else {
-        channelMeasurements.push(measurement);
+        (messages as RawMessage[]).push({
+          logTime: value.logTime,
+          channelId: value.channelId,
+          data: value.data,
+        });
       }
     }
-  };
 
-  const postResults = (opts: { isDone: boolean }) => {
-    const results: ChannelResult[] = [];
-
-    for (const [, channel] of reader.channelsById.entries()) {
-      const schema = reader.schemasById.get(channel.schemaId);
-      const measurements = measurementsByChannelId.get(channel.id) ?? [];
-      const totalBytes = measurements.reduce(
-        (acc, measurement) => acc + measurement.numBytes,
-        0
-      );
-      const totalMessages = measurements.reduce(
-        (acc, measurement) => acc + measurement.numMsgs,
-        0
-      );
-      const totalDurationMs = measurements.reduce(
-        (acc, measurement) => acc + measurement.durationMs,
-        0
-      );
-
-      results.push({
-        id: channel.id,
-        topic: channel.topic,
-        schemaName: schema?.name ?? "?",
-        schemaEncoding: schema?.encoding ?? "?",
-        messageEncoding: channel.messageEncoding,
-        totalBytes,
-        totalMessages,
-        totalDurationMs,
-        bytesPerSec:
-          totalDurationMs > 0 ? totalBytes / (totalDurationMs / 1000) : 0,
-      });
-    }
-
-    self.postMessage({ results, isDone: opts.isDone });
-  };
-
-  for await (const message of reader.readMessages({
-    validateCrcs: false,
-  })) {
-    const channelMessages = messageDataByChannelId.get(message.channelId);
-    if (channelMessages == undefined) {
-      messageDataByChannelId.set(message.channelId, [message.data]);
+    if (this.#deserialize) {
+      return messages;
     } else {
-      channelMessages.push(message.data);
-    }
-
-    chunkSizeInBytes += message.data.length;
-    if (chunkSizeInBytes > chunkSizeBytes) {
-      measureDeserializationTimes();
-      postResults({ isDone: false });
-      chunkSizeInBytes = 0;
-      messageDataByChannelId = new Map();
+      return comlink.transfer(
+        messages,
+        messages.map((msg) => (msg as RawMessage).data.buffer)
+      );
     }
   }
-  measureDeserializationTimes();
-  postResults({ isDone: true });
 }
 
-self.onmessage = async (event) => {
-  const { blob, chunkSizeMb } = event.data;
-  await run(blob, chunkSizeMb * 1024 * 1024);
-};
+const obj = new WorkerReader();
+comlink.expose(obj);
