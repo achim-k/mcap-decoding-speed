@@ -18,3 +18,7 @@ export function fromNanoSec(nsec: bigint): Time {
 export function median(arr: number[]) {
   return arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
 };
+
+export function sum(arr: number[]) {
+  return arr.reduce((acc, val) => acc + val, 0);
+};

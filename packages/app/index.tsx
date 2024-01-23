@@ -1,6 +1,9 @@
 import { createRoot } from "react-dom/client";
 
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Box,
   Button,
   Checkbox,
@@ -10,7 +13,7 @@ import {
   LinearProgress,
   Stack,
   Tooltip,
-  Typography,
+  Typography
 } from "@mui/material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -18,9 +21,10 @@ import {
   parseChannel,
 } from "../studio/packages/mcap-support/src";
 import EnhancedTable from "./ResultTable";
-import { ChannelStats, McapInfo, Message, RawMessage } from "./types";
-import { toSec, fromNanoSec, median } from "./utils";
+import RunHistory from "./RunHistory";
 import WorkerInterface from "./WorkerInterface";
+import { ChannelStats, McapInfo, Message, RawMessage } from "./types";
+import { fromNanoSec, median, toSec } from "./utils";
 
 type Config = {
   messageBatchSize: number;
@@ -28,57 +32,117 @@ type Config = {
   selectedChannelIds: readonly number[];
 };
 
-type State = {
-  isRunning: boolean;
+type TotalAndMedian = {
+  median: number;
+  total: number;
+  cycles: number[];
+};
+
+type RunStatistics = {
+  progress: number;
   totalTimeSec: number;
   realTimeFactor: number;
-  medianDeserializationDuration: number;
-  medianCycleDuration: number;
-  medianFetchMessageDuration: number;
-  medianPostMessageDuration: number;
-  medianStructuredDeserializeDuration: number;
-  progress: number;
+  deserializationDuration: TotalAndMedian;
+  fetchMessageDuration: TotalAndMedian;
+  postMessageDuration: TotalAndMedian;
+  structuredDeserializeDuration: TotalAndMedian;
+};
+
+export type CompletedRun = {
+  filename: string;
+  config: Config;
+  stats: RunStatistics;
+  statsByChannel: Map<number, ChannelStats>;
+}
+
+type State = {
+  isRunning: boolean;
+  currentStats: RunStatistics;
+};
+
+const EMPTY_RUN_STATS : RunStatistics = {
+  progress: 0,
+  realTimeFactor: 0,
+  totalTimeSec: 0,
+  deserializationDuration: { median: 0, total: 0, cycles: [] },
+  fetchMessageDuration: { median: 0, total: 0, cycles: [] },
+  postMessageDuration: { median: 0, total: 0, cycles: [] },
+  structuredDeserializeDuration: { median: 0, total: 0, cycles: [] },
 };
 
 const EMPTY_STATE: State = {
   isRunning: false,
-  totalTimeSec: 0,
-  realTimeFactor: 0,
-  medianDeserializationDuration: 0,
-  medianCycleDuration: 0,
-  medianFetchMessageDuration: 0,
-  medianPostMessageDuration: 0,
-  medianStructuredDeserializeDuration: 0,
-  progress: 0,
+  currentStats: { ...EMPTY_RUN_STATS },
 };
 
-type RunState = {
+type CurrentRun = {
   statsByChannel: Map<number, ChannelStats>;
   deserializerByChannelId: Map<number, ParsedChannel["deserialize"]>;
-  firstMessageLogTime?: bigint;
-  currentLogTime?: bigint;
-  startMs?: number;
-  deserializationDurations: number[];
-  cycleDurations: number[];
-  fetchMessageDurations: number[];
-  postMessageDurations: number[];
-  structuredDeserializeDurations: number[];
+  messageTimeRead?: bigint;
+  performanceStart?: number;
   stopped?: boolean;
+  stats: RunStatistics;
 };
 
 const worker = new WorkerInterface();
-const runState: RunState = {
+const currentRun: CurrentRun = {
   statsByChannel: new Map(),
   deserializerByChannelId: new Map(),
-  deserializationDurations: [],
-  cycleDurations: [],
-  fetchMessageDurations: [],
-  postMessageDurations: [],
-  structuredDeserializeDurations: [],
+  stats: { ...EMPTY_RUN_STATS },
 };
 
+function aggregateRunStats(
+  run: CurrentRun,
+  fileInfo: McapInfo
+): RunStatistics {
+  const secondsSinceStart = run.performanceStart
+    ? (performance.now() - run.performanceStart) / 1e3
+    : 0;
+  const secondsRead = toSec(fromNanoSec(run.messageTimeRead ?? 0n));
+  const fileDurationSeconds = toSec(
+    fromNanoSec(fileInfo.endTime - fileInfo.startTime)
+  );
+  const realTimeFactor = secondsRead / secondsSinceStart;
+  const progress = secondsRead / fileDurationSeconds;
+  const deserializationMedian = median(run.stats.deserializationDuration.cycles) ?? 0;
+  const fetchMessageMedian = median(run.stats.fetchMessageDuration.cycles) ?? 0;
+  const structuredDeerializeMedian = median(run.stats.structuredDeserializeDuration.cycles) ?? 0;
+  const postMessageMedian = median(run.stats.postMessageDuration.cycles) ?? 0;
+
+  run.stats.deserializationDuration.cycles = [];
+  run.stats.fetchMessageDuration.cycles = [];
+  run.stats.structuredDeserializeDuration.cycles = [];
+  run.stats.postMessageDuration.cycles = [];
+
+  return {
+    progress,
+    totalTimeSec: secondsSinceStart,
+    realTimeFactor,
+    deserializationDuration: {
+      ...run.stats.deserializationDuration,
+      cycles: [],
+      median: deserializationMedian,
+    },
+    fetchMessageDuration: {
+      ...run.stats.fetchMessageDuration,
+      cycles: [],
+      median: fetchMessageMedian,
+    },
+    structuredDeserializeDuration: {
+      ...run.stats.structuredDeserializeDuration,
+      cycles: [],
+      median: structuredDeerializeMedian,
+    },
+    postMessageDuration: {
+      ...run.stats.postMessageDuration,
+      cycles: [],
+      median: postMessageMedian,
+    },
+  };
+}
+
 function App() {
-  const [fileInfo, setFileInfo] = useState<McapInfo | undefined>();
+  const [fileInfo, setFileInfo] = useState<McapInfo & { filename: string } | undefined>();
   const [config, setConfig] = useState<Config>({
     messageBatchSize: 1,
     deserializeInWorker: true,
@@ -86,54 +150,21 @@ function App() {
   });
   const [state, setState] = useState<State>(EMPTY_STATE);
   const fileInputRef = useRef<HTMLInputElement>();
+  const [runHistory, setRunHistory] = useState<CompletedRun[]>([]);
 
   // Re-render every 500ms
   useEffect(() => {
     const interval = setInterval(() => {
-      if (!state.isRunning) {
+      if (!state.isRunning || !fileInfo) {
         return;
       }
-      const secondsSinceStart = runState.startMs
-        ? (performance.now() - runState.startMs) / 1e3
-        : 0;
-      const secondsRead = toSec(
-        fromNanoSec(
-          (runState.currentLogTime ?? 0n) - (runState.firstMessageLogTime ?? 0n)
-        )
-      );
-      const realTimeFactor = secondsRead / secondsSinceStart;
-      const medianDeserializationDuration = median(runState.deserializationDurations);
-      const medianCycleDuration = median(runState.cycleDurations);
-      const medianFetchMessageDurations = median(
-        runState.fetchMessageDurations
-      );
-      const medianStructuredDeserializeDurations = median(
-        runState.structuredDeserializeDurations
-      );
-      const medianPostMessageDurations = median(runState.postMessageDurations);
-      runState.deserializationDurations = [];
-      runState.cycleDurations = [];
-      runState.fetchMessageDurations = [];
-      runState.structuredDeserializeDurations = [];
-      runState.postMessageDurations = [];
-
-      const progress =
-        fileInfo && runState.currentLogTime
-          ? Number(runState.currentLogTime - fileInfo?.startTime) /
-            Number(fileInfo?.endTime - fileInfo?.startTime)
-          : 0;
 
       setState((oldState) => ({
         ...oldState,
-        totalTimeSec: secondsSinceStart,
-        realTimeFactor,
-        medianDeserializationDuration: medianDeserializationDuration ?? 0,
-        medianCycleDuration: medianCycleDuration ?? 0,
-        medianFetchMessageDuration: medianFetchMessageDurations ?? 0,
-        medianStructuredDeserializeDuration:
-          medianStructuredDeserializeDurations ?? 0,
-        medianPostMessageDuration: medianPostMessageDurations ?? 0,
-        progress,
+        currentStats: aggregateRunStats(
+          currentRun,
+          fileInfo,
+        ),
       }));
     }, 500);
     return () => clearInterval(interval);
@@ -174,13 +205,14 @@ function App() {
       const { startTime, endTime, channelsById, schemasById } =
         await worker.initialize(selectedFile);
 
-      runState.statsByChannel.clear();
-      runState.deserializerByChannelId.clear();
+      currentRun.statsByChannel.clear();
+      currentRun.deserializerByChannelId.clear();
+      currentRun.stats = structuredClone(EMPTY_RUN_STATS);
 
       for (const [, channel] of channelsById.entries()) {
         try {
           const schema = schemasById.get(channel.schemaId);
-          runState.statsByChannel.set(channel.id, {
+          currentRun.statsByChannel.set(channel.id, {
             id: channel.id,
             messageEncoding: channel.messageEncoding,
             schemaEncoding: schema?.encoding ?? "",
@@ -194,7 +226,7 @@ function App() {
             messageEncoding: channel.messageEncoding,
             schema,
           });
-          runState.deserializerByChannelId.set(channel.id, deserialize);
+          currentRun.deserializerByChannelId.set(channel.id, deserialize);
         } catch (err) {
           console.error(
             `Failed to parse channel ${channel.id} (${channel.topic})`
@@ -207,9 +239,10 @@ function App() {
         endTime,
         channelsById,
         schemasById,
+        filename: selectedFile.name,
       });
-      setConfig((oldState) => ({
-        ...oldState,
+      setConfig((oldConfig) => ({
+        ...oldConfig,
         selectedChannelIds: [...channelsById.keys()],
       }));
       setState({
@@ -220,7 +253,7 @@ function App() {
   );
 
   const onStopClick = useCallback(() => {
-    runState.stopped = true;
+    currentRun.stopped = true;
   }, []);
 
   const onRunClick = useCallback(async () => {
@@ -228,7 +261,7 @@ function App() {
       return;
     }
 
-    for (const channelStats of runState.statsByChannel.values()) {
+    for (const channelStats of currentRun.statsByChannel.values()) {
       channelStats.totalBytes = 0;
       channelStats.totalDurationMs = 0;
       channelStats.totalMessages = 0;
@@ -240,7 +273,7 @@ function App() {
     });
 
     const selectedTopics: string[] = config.selectedChannelIds.map(
-      (channelId) => runState.statsByChannel.get(channelId)!.topic
+      (channelId) => currentRun.statsByChannel.get(channelId)!.topic
     );
 
     await worker.createIterator({
@@ -248,34 +281,39 @@ function App() {
       deserialize: config.deserializeInWorker,
     });
 
-    runState.firstMessageLogTime = runState.currentLogTime = undefined;
-    const totalStart = (runState.startMs = performance.now());
-    runState.stopped = false;
+    let firstMessageLogTime: bigint | undefined = undefined;
+    currentRun.messageTimeRead = undefined;
+    currentRun.stopped = false;
+    currentRun.performanceStart = performance.now();
+    currentRun.stats = structuredClone(EMPTY_RUN_STATS);
 
-    while (!runState.stopped) {
+    while (!currentRun.stopped) {
       const cycleStart = performance.now();
       const { messages, postMessageDuration, structuredDeserializeDuration } =
         await worker.fetchMessages(config.messageBatchSize);
       const fetchDuration = performance.now() - cycleStart;
-      runState.firstMessageLogTime ??= messages[0]?.logTime;
-      runState.currentLogTime = messages[0]?.logTime;
+      if (!messages.length) break;
+
+      firstMessageLogTime ??= messages[0]!.logTime;
+      currentRun.messageTimeRead =
+        messages[messages.length - 1]!.logTime - firstMessageLogTime;
 
       let deserializationDuration = 0;
       for (const msg of messages) {
         if (config.deserializeInWorker) {
           const { channelId, sizeInBytes, deserializationTimeMs } =
             msg as Message;
-          const channelStats = runState.statsByChannel.get(channelId)!;
+          const channelStats = currentRun.statsByChannel.get(channelId)!;
           channelStats.totalBytes += sizeInBytes;
           channelStats.totalMessages += 1;
           channelStats.totalDurationMs += deserializationTimeMs;
           deserializationDuration += deserializationTimeMs;
         } else {
           const { channelId, data } = msg as RawMessage;
-          const channelStats = runState.statsByChannel.get(channelId)!;
+          const channelStats = currentRun.statsByChannel.get(channelId)!;
           channelStats.totalBytes += data.byteLength;
           channelStats.totalMessages += 1;
-          const deserialize = runState.deserializerByChannelId.get(channelId);
+          const deserialize = currentRun.deserializerByChannelId.get(channelId);
           if (deserialize) {
             const start = performance.now();
             deserialize(data);
@@ -290,23 +328,31 @@ function App() {
         break; // End of file.
       }
 
-      const cycleDuration = performance.now() - cycleStart;
-      runState.deserializationDurations.push(deserializationDuration);
-      runState.cycleDurations.push(cycleDuration);
-      runState.fetchMessageDurations.push(fetchDuration);
-      runState.postMessageDurations.push(postMessageDuration);
-      runState.structuredDeserializeDurations.push(
-        structuredDeserializeDuration
-      );
+      currentRun.stats.deserializationDuration.total += deserializationDuration;
+      currentRun.stats.deserializationDuration.cycles.push(deserializationDuration);
+      currentRun.stats.fetchMessageDuration.total += fetchDuration;
+      currentRun.stats.fetchMessageDuration.cycles.push(fetchDuration);
+      currentRun.stats.postMessageDuration.total += postMessageDuration;
+      currentRun.stats.postMessageDuration.cycles.push(postMessageDuration);
+      currentRun.stats.structuredDeserializeDuration.total += structuredDeserializeDuration;
+      currentRun.stats.structuredDeserializeDuration.cycles.push(structuredDeserializeDuration);
     }
+
+    const runStats = aggregateRunStats(currentRun, fileInfo);
 
     setState((oldState) => ({
       ...oldState,
       isRunning: false,
-      totalTimeSec: (performance.now() - totalStart) / 1000,
-      progress: runState.stopped ? oldState.progress : 1,
+      totalTimeSec: (performance.now() - currentRun.performanceStart!) / 1000,
+      currentStats: runStats,
     }));
-  }, [fileInfo, state, config]);
+    setRunHistory((oldHistory) => [...oldHistory, {
+      config,
+      filename: fileInfo.filename,
+      stats: { ...runStats },
+      statsByChannel: structuredClone(currentRun.statsByChannel),
+    }]);
+  }, [fileInfo, config]);
 
   return (
     <div>
@@ -379,53 +425,84 @@ function App() {
       >
         <Tooltip title="Total elapsed time">
           <Typography>
-            Elapsed time: <b>{state.totalTimeSec.toFixed(2)}</b> s
+            Elapsed time:{" "}
+            <Typography component="span" fontWeight={700}>
+              {state.currentStats.totalTimeSec.toFixed(2)} s
+            </Typography>
           </Typography>
         </Tooltip>
-        <Typography>
-          Message fetching:{" "}
-          <Tooltip title="Median message fetching (total) duration">
-            <b>{state.medianFetchMessageDuration.toFixed(2)}</b>
-          </Tooltip>{" "}
-          |{" "}
-          <Tooltip title="Median structuredDeserialize duration">
-            <b>{state.medianStructuredDeserializeDuration.toFixed(2)}</b>
-          </Tooltip>{" "}
-          |{" "}
-          <Tooltip title="Median postMessage duration">
-            <b>{state.medianPostMessageDuration.toFixed(2)}</b>
-          </Tooltip>{" "}
-          ms{" "}
-        </Typography>
-        <Tooltip title={`Median time to deserialize all messages in the batch`}>
-          <Typography>
-            Deserialization:{" "}
-            <b>{state.medianDeserializationDuration.toFixed(2)}</b> ms
-          </Typography>
+        <Tooltip title="Total time for fetching messages as well as the time for structuredDeserialize (main thread) and postMessage (worker). For all three times, the total and the median time (per batch) are shown. Note that the time for fetching messages is the roundtrip time which includes time to read messages from the mcap file and eventually deserializing them in the worker.">
+          <Stack direction={"row"} divider={<span>|</span>} spacing={1}>
+            <Typography component="span">Message fetching</Typography>
+            <Typography fontWeight={700}>
+              {(state.currentStats.fetchMessageDuration.total / 1e3).toFixed(2)}{" "}
+              s ({state.currentStats.fetchMessageDuration.median.toFixed(2)} ms)
+            </Typography>
+            <Typography fontWeight={700}>
+              {(
+                state.currentStats.structuredDeserializeDuration.total / 1e3
+              ).toFixed(2)}{" "}
+              s (
+              {state.currentStats.structuredDeserializeDuration.median.toFixed(
+                2
+              )}{" "}
+              ms)
+            </Typography>
+            <Typography fontWeight={700}>
+              {(state.currentStats.postMessageDuration.total / 1e3).toFixed(2)}{" "}
+              s ({state.currentStats.postMessageDuration.median.toFixed(2)} ms)
+            </Typography>
+          </Stack>
         </Tooltip>
         <Tooltip
-          title={`Median time to fetch and deserialize messages of the specified bulk size (${config.messageBatchSize})`}
+          title={`Total time (and median time) to deserialize all messages in the batch.`}
         >
           <Typography>
-            Total: <b>{state.medianCycleDuration.toFixed(2)}</b> ms
+            Deserialization:{" "}
+            <Typography component="span" fontWeight={700}>
+              {(state.currentStats.deserializationDuration.total / 1e3).toFixed(
+                2
+              )}{" "}
+              s ({state.currentStats.deserializationDuration.median.toFixed(2)}{" "}
+              ms)
+            </Typography>
           </Typography>
         </Tooltip>
         <Tooltip title="Factor indicating if messages can be read in realtime speed. A factor of 1 means that messages are read at the same speed as they were recorded. Higher is better.">
           <Typography>
-            Reading speed: <b>{state.realTimeFactor.toFixed(2)}x</b>
+            Reading speed:
+            <Typography component="span" fontWeight={700}>
+              {state.currentStats.realTimeFactor.toFixed(2)}x
+            </Typography>
           </Typography>
         </Tooltip>
       </Stack>
 
       <Box sx={{ width: "100%", paddingTop: "1em", paddingBottom: "1em" }}>
-        <LinearProgress variant="determinate" value={state.progress * 100} />
+        <LinearProgress
+          variant="determinate"
+          value={state.currentStats.progress * 100}
+        />
       </Box>
       <EnhancedTable
-        data={[...runState.statsByChannel.values()]}
+        data={[...currentRun.statsByChannel.values()]}
         selected={config.selectedChannelIds}
         onSelected={onSelected}
         disabled={fileInfo == undefined || state.isRunning}
       />
+
+      <Accordion sx={{marginTop: "1em"}}>
+        <AccordionSummary
+          aria-controls="panel1-content"
+          id="panel1-header"
+        >
+          <Typography>Run History ({runHistory.length})</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <RunHistory history={runHistory} />
+        </AccordionDetails>
+      </Accordion>
+
     </div>
   );
 }
